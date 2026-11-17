@@ -1,0 +1,11 @@
+<resources>
+    <string name="google_attribution" translatable="false">Powered by Google Translate</string>
+    <string name="app_name">Screen Translator</string>
+    <style name="Theme.ScreenTranslator" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#A8C7FA</item>
+        <item name="android:windowBackground">#101318</item>
+        <item name="android:navigationBarColor">#101318</item>
+    </style>
+</resources>
