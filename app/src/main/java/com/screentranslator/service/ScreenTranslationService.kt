@@ -17,6 +17,10 @@ import com.screentranslator.R
 import com.screentranslator.capture.*
 import com.screentranslator.core.*
 import com.screentranslator.data.SettingsRepository
+import com.screentranslator.data.ApiKeys
+import com.screentranslator.data.SecretUnavailable
+import com.screentranslator.gemini.*
+import com.screentranslator.overlay.BlurBackgroundRenderer
 import com.screentranslator.engine.*
 import com.screentranslator.overlay.OverlayController
 import com.screentranslator.ui.MainActivity
@@ -31,7 +35,10 @@ class ScreenTranslationService : Service() {
     private var capture: ScreenCaptureManager? = null
     private var overlay: OverlayController? = null
     private var ocr: OcrEngine? = null
-    private var translator: TranslationEngine? = null
+    private var translator: TranslationPipeline? = null
+    private var gemini: GeminiApiClient? = null
+    private var mode = AppMode.LOCAL
+    private val stopCallback: () -> Unit = { finishSession("Настройки изменены. Запустите переводчик снова.") }
     private val cache = TranslationCache()
     private var request: Job? = null
     private var search: ScreenSearchSession? = null
@@ -59,6 +66,7 @@ class ScreenTranslationService : Service() {
     }
     override fun onCreate() {
         super.onCreate()
+        Session.stopActiveSession = stopCallback
         ContextCompat.registerReceiver(this, screenOff, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED)
         getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, Handler(Looper.getMainLooper()))
         scope.launch(Dispatchers.IO) { runCatching { SearchFiles(this@ScreenTranslationService).cleanup() } }
@@ -76,8 +84,9 @@ class ScreenTranslationService : Service() {
             }
             requireNotNull(consent)
             check(Settings.canDrawOverlays(this)) { "Нужно разрешение на отображение поверх приложений" }
+            mode = AppMode.entries.firstOrNull { it.name == intent.getStringExtra("mode") } ?: AppMode.LOCAL
             pair = LanguagePair(intent.getStringExtra("source") ?: "en", intent.getStringExtra("target") ?: "ru")
-            require(Languages.supports(pair)) { "Недоступное направление перевода" }
+            require(Languages.supports(pair, mode)) { "Недоступное направление перевода" }
             showNotification() // Must precede getMediaProjection on Android 14+.
             val projection = getSystemService(MediaProjectionManager::class.java).getMediaProjection(Activity.RESULT_OK, consent)
             val bounds = screenSize()
@@ -85,7 +94,9 @@ class ScreenTranslationService : Service() {
             captureWidth = bounds.first; captureHeight = bounds.second
             capture = ScreenCaptureManager(projection, captureWidth, captureHeight, resources.configuration.densityDpi, rotation(),
                 { width, height -> resize(width, height) }, { finishSession("Система завершила захват. Для новой сессии нажмите «Запустить переводчик».") })
-            ocr = LatinOcrEngine(); translator = MlTranslationEngine(pair)
+            ocr = LatinOcrEngine()
+            if (mode == AppMode.GEMINI) gemini = GeminiApiClient(ApiKeys.get(this)::read)
+            translator = TranslationPipeline(mode, pair, cache, gemini)
             scope.launch {
                 try {
                     val repository = SettingsRepository(this@ScreenTranslationService)
@@ -120,6 +131,7 @@ class ScreenTranslationService : Service() {
         val token = coordinator.begin()
         request = scope.launch {
             var frame: CapturedFrame? = null
+            var blurred: android.graphics.Bitmap? = null
             try {
                 notice?.cancel()
                 overlay?.hideForCapture()
@@ -128,33 +140,33 @@ class ScreenTranslationService : Service() {
                 frame = capture?.snapshot() ?: error("Сессия завершена")
                 overlay?.showButton()
                 if (!coordinator.advance(token, Phase.RECOGNIZING)) return@launch
-                val blocks = ocr!!.recognize(frame.bitmap)
+                val pipeline = translator!!
+                coordinator.message(token, "Распознаю текст")
+                val blocks = if (pipeline.needsImageOcr) null else ocr!!.recognize(frame.bitmap)
                 ensureActive()
-                if (blocks.isEmpty()) { coordinator.fail(token, "Не удалось прочитать текст на экране. Попробуйте другой экран или повторите снимок."); showError(); return@launch }
+                if (blocks != null && blocks.isEmpty()) { coordinator.fail(token, "Не удалось прочитать текст на экране. Повторите снимок или выберите другую область."); showError(); return@launch }
                 if (!coordinator.advance(token, Phase.TRANSLATING)) return@launch
-                val translated = withContext(Dispatchers.Default) {
-                    blocks.map { block ->
-                        ensureActive()
-                        val key = TranslationKey(block.text, pair)
-                        val value = cache.get(key) ?: translator!!.translate(block.text).also { cache.put(key, it) }
-                        TranslatedBlock(block, value)
-                    }
-                }
+                coordinator.message(token, if (mode == AppMode.GEMINI) "Перевожу через Gemini" else "Перевожу текст")
+                val translated = if (blocks == null) pipeline.translateImage(frame.bitmap) else pipeline.translateBlocks(blocks)
+                if (translated.isEmpty()) { coordinator.fail(token, "Не удалось найти текст на изображении."); showError(); return@launch }
+                blurred = withContext(Dispatchers.Default) { BlurBackgroundRenderer.prepare(frame.bitmap) }
+                ensureActive()
                 if (coordinator.accepts(token)) {
-                    overlay!!.show(frame, translated)
+                    overlay!!.show(frame, translated, blurred, mode.attribution + if (pipeline.needsImageOcr) " · координаты ≈" else "")
+                    blurred = null
                     frame = null // Ownership moves to the overlay until it is removed.
                     coordinator.advance(token, Phase.SHOWING)
                 }
             } catch (_: TimeoutCancellationException) {
                 if (coordinator.accepts(token)) { coordinator.fail(token, "Нет свежего кадра. Повторите снимок."); showError() }
             } catch (e: CancellationException) { throw e }
-            catch (_: Exception) {
+            catch (e: Exception) {
                 if (coordinator.accepts(token)) {
                     overlay?.hideResult()
-                    coordinator.fail(token, "Не удалось распознать или перевести экран. Повторите снимок; при необходимости загрузите модели заново."); showError()
+                    coordinator.fail(token, when (e) { is GeminiException -> e.message!!; is SecretUnavailable -> "Не удалось расшифровать ключ. Сохраните его заново."; else -> "Не удалось распознать или перевести экран. Повторите снимок." }); showError()
                 }
             } finally {
-                frame?.bitmap?.recycle()
+                frame?.bitmap?.recycle(); blurred?.recycle()
                 if (coordinator.accepts(token) || !coordinator.state.value.busy) showButtonIfAllowed()
             }
         }
@@ -173,7 +185,7 @@ class ScreenTranslationService : Service() {
                 notice?.cancel(); overlay?.hideForCapture(); delay(180)
                 frame = capture?.snapshot() ?: error("Сессия завершена")
                 if (!coordinator.advance(token, Phase.SELECTING)) return@launch
-                val selected = ScreenSearchSession(token, frame, scope, coordinator, ocr!!, translator!!, pair, cache,
+                val selected = ScreenSearchSession(token, frame, scope, coordinator, ocr!!, translator!!, gemini?.let(::GeminiSearchEngine),
                     SearchFiles(this@ScreenTranslationService), { overlay?.hideButton() }, { invalidate() })
                 search = selected; SearchSessions.install(selected); frame = null
                 // The user granted SYSTEM_ALERT_WINDOW and initiated this from a visible overlay.
@@ -231,12 +243,16 @@ class ScreenTranslationService : Service() {
         return if (Build.VERSION.SDK_INT >= 30) wm.maximumWindowMetrics.bounds.let { it.width() to it.height() }
         else android.util.DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }.let { it.widthPixels to it.heightPixels }
     }
-    private fun finishSession(message: String) { coordinator.stop(message); stopSelf() }
+    private fun finishSession(message: String) {
+        coordinator.stop(message); request?.cancel(); search?.dispose(); gemini?.close(); stopSelf()
+    }
     override fun onDestroy() {
         if (destroyed) return
         destroyed = true
         if (coordinator.state.value.active) coordinator.stop()
         scope.cancel()
+        if (Session.stopActiveSession === stopCallback) Session.stopActiveSession = null
+        gemini?.close(); gemini = null
         notice?.cancel(); search?.dispose(); search = null
         overlay?.close(); overlay = null
         capture?.close(); capture = null

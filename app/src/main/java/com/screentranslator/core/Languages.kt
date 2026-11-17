@@ -22,5 +22,6 @@ object Languages {
     val sources = targets.filter { it.code in sourceCodes }
     fun supports(pair: LanguagePair) = pair.source in sourceCodes &&
         targets.any { it.code == pair.target } && pair.source != pair.target
+    fun supports(pair: LanguagePair, mode: AppMode) = if (mode == AppMode.LOCAL) supports(pair) else pair.source != pair.target && targets.any { it.code == pair.source } && targets.any { it.code == pair.target }
     fun name(code: String) = targets.firstOrNull { it.code == code }?.name ?: code
 }

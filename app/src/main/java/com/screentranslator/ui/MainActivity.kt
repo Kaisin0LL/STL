@@ -22,6 +22,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
@@ -40,6 +44,7 @@ class MainActivity : ComponentActivity() {
                 ContextCompat.startForegroundService(this, Intent(this, ScreenTranslationService::class.java).apply {
                     action = ScreenTranslationService.START
                     putExtra("consent", result.data)
+                    putExtra("mode", vm.settings.value.mode.name)
                     putExtra("source", vm.settings.value.pair.source)
                     putExtra("target", vm.settings.value.pair.target)
                 })
@@ -66,6 +71,10 @@ class MainActivity : ComponentActivity() {
                 val status by vm.status.collectAsStateWithLifecycle()
                 val loading by vm.loading.collectAsStateWithLifecycle()
                 val requesting by vm.requestingPermission.collectAsStateWithLifecycle()
+                val keyStatus by vm.keyStatus.collectAsStateWithLifecycle()
+                val keyBusy by vm.keyBusy.collectAsStateWithLifecycle()
+                var keyInput by remember { mutableStateOf("") }
+                var revealKey by remember { mutableStateOf(false) }
                 var about by remember { mutableStateOf(false) }
                 LaunchedEffect(Unit) {
                     lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
@@ -86,34 +95,53 @@ class MainActivity : ComponentActivity() {
                         Spacer(Modifier.height(24.dp))
                         Text("Screen Translator", style = MaterialTheme.typography.headlineLarge)
                         Text("Перевод экрана одним нажатием", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        LanguageMenu("С какого языка", settings.pair.source, Languages.sources, !loading && !requesting && !session.active) { vm.setPair(settings.pair.copy(source = it)) }
-                        LanguageMenu("На какой язык", settings.pair.target, Languages.targets, !loading && !requesting && !session.active) { vm.setPair(settings.pair.copy(target = it)) }
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            AppMode.entries.forEach { mode -> FilterChip(selected = settings.mode == mode, onClick = { vm.setMode(mode) }, label = { Text(mode.label) }, enabled = !loading && !requesting && !keyBusy) }
+                        }
+                        if (settings.mode == AppMode.GEMINI) {
+                            Text("Gemini 3.5 Flash-Lite", style = MaterialTheme.typography.titleMedium)
+                            Text("В режиме Gemini текст и выбранные изображения обрабатываются сервисом Google. Требуется интернет, используется квота вашего API.", style = MaterialTheme.typography.bodySmall)
+                            OutlinedTextField(value = keyInput, onValueChange = { keyInput = it }, label = { Text("Gemini API-ключ") }, singleLine = true,
+                                modifier = Modifier.fillMaxWidth(), visualTransformation = if (revealKey) VisualTransformation.None else PasswordVisualTransformation(),
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                                trailingIcon = { TextButton(onClick = { revealKey = !revealKey }) { Text(if (revealKey) "Скрыть" else "Показать") } })
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(onClick = { vm.saveKey(keyInput) { keyInput = ""; revealKey = false } }, enabled = keyInput.isNotBlank() && !keyBusy && !requesting) { Text("Сохранить") }
+                                TextButton(onClick = { keyInput = ""; vm.deleteKey() }, enabled = !requesting) { Text("Удалить ключ") }
+                            }
+                            OutlinedButton(onClick = vm::verifyKey, enabled = !keyBusy && !requesting && !session.active) { Text("Проверить подключение") }
+                            Text(keyStatus, color = MaterialTheme.colorScheme.primary)
+                            Text("Сохранение не требует интернета и активирует Gemini. Для замены введите новый ключ. Проверка подключения использует небольшую часть квоты.", style = MaterialTheme.typography.bodySmall)
+                            if (settings.pair.source !in Languages.sourceCodes) Text("Для этой письменности Gemini получает изображение: при переводе экрана — весь снимок, при поиске — выбранный фрагмент. Координаты модели приблизительны.", style = MaterialTheme.typography.bodySmall)
+                        }
+                        LanguageMenu("С какого языка", settings.pair.source, if (settings.mode == AppMode.GEMINI) Languages.targets else Languages.sources, !loading && !requesting && !keyBusy) { vm.setPair(settings.pair.copy(source = it)) }
+                        LanguageMenu("На какой язык", settings.pair.target, Languages.targets, !loading && !requesting && !keyBusy) { vm.setPair(settings.pair.copy(target = it)) }
+                        if (settings.mode == AppMode.LOCAL) Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Checkbox(settings.mobileDownload, { vm.setMobile(it) }, enabled = !loading && !requesting && !session.active)
                             Text("Разрешить загрузку моделей по мобильной сети", Modifier.padding(top = 10.dp))
                         }
-                        Text("По умолчанию модели загружаются по Wi-Fi. После загрузки выбранная пара работает без интернета.", style = MaterialTheme.typography.bodySmall)
+                        if (settings.mode == AppMode.LOCAL) Text("По умолчанию модели загружаются по Wi-Fi. После загрузки выбранная пара работает без интернета.", style = MaterialTheme.typography.bodySmall)
                         Button(onClick = {
                             if (session.active) {
                                 val stopIntent = Intent(this@MainActivity, ScreenTranslationService::class.java)
                                 this@MainActivity.stopService(stopIntent)
                             }
                             else vm.prepare()
-                        }, enabled = !loading && !requesting, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
+                        }, enabled = !loading && !requesting && !keyBusy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
                             Text(if (session.active) "Остановить переводчик" else "Запустить переводчик")
                         }
                         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
                         Text(if (session.active) session.message else status,
                             color = MaterialTheme.colorScheme.primary)
                         Text("В системном окне выберите весь экран. Кнопка «文» делает снимок; следующее нажатие скрывает перевод. Во время обработки нажатие отменяет запрос. Удерживайте кнопку, чтобы выделить область для поиска текста или изображения.")
-                        Text("Переводы предоставлены Google Translate", style = MaterialTheme.typography.labelMedium)
+                        Text(settings.mode.attribution, style = MaterialTheme.typography.labelMedium)
                         TextButton(onClick = { about = true }) { Text("О приложении") }
                     }
                 }
                 if (about) AlertDialog(onDismissRequest = { about = false }, confirmButton = { TextButton(onClick = { about = false }) { Text("Понятно") } },
                     title = { Text("О Screen Translator") }, text = {
                         Column(Modifier.verticalScroll(rememberScrollState())) {
-                            Text("Полный снимок, OCR и перевод обрабатываются на устройстве. Поиск отправляет исправленный запрос внешнему браузеру только по вашему нажатию. При передаче изображения временно сохраняется только выбранный фрагмент; постоянное сохранение — отдельное действие. Временные PNG доступны получателю до 24 часов. Захват активен до остановки, блокировки или отзыва системой. На защищённых экранах перевод может быть недоступен.\n\nBundled ML Kit Text Recognition v2: латиница. ML Kit Translation: машинный перевод Google; возможны неточности. Исходный русский недоступен, поскольку Latin OCR не распознаёт кириллицу.\n\nKotlin, Coroutines и AndroidX — Apache License 2.0. ML Kit и Google Play services — условия Google. Подробнее: THIRD_PARTY_NOTICES.md в исходниках.")
+                            Text("В обычном режиме OCR и перевод выполняются на устройстве. В Gemini API текст передаётся Google; для неподдерживаемой Latin OCR письменности отправляется снимок. Анализ изображения Gemini отправляет только выбранный фрагмент. Ключ шифруется Android Keystore и не включается в резервную копию. Поиск Gemini отправляет исправленный запрос Google по вашему нажатию. Обычный поиск открывает запрос во внешнем браузере. При передаче изображения временно сохраняется только выбранный фрагмент; постоянное сохранение — отдельное действие. Временные PNG доступны получателю до 24 часов. Захват активен до остановки, блокировки или отзыва системой. На защищённых экранах перевод может быть недоступен.\n\nBundled ML Kit Text Recognition v2: латиница. ML Kit Translation: машинный перевод Google; возможны неточности. В обычном режиме исходный русский недоступен. В Gemini кириллица распознаётся по изображению; координаты приблизительны.\n\nKotlin, Coroutines и AndroidX — Apache License 2.0. ML Kit и Google Play services — условия Google. Подробнее: THIRD_PARTY_NOTICES.md в исходниках.")
                             TextButton(onClick = { startActivity(Intent(Intent.ACTION_VIEW, "https://developers.google.com/ml-kit/language/translation/translation-terms".toUri())) }) { Text("Условия ML Kit Translation") }
                         }
                     })
