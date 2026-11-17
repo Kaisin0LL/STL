@@ -5,11 +5,13 @@ import android.net.Uri
 import com.screentranslator.capture.CapturedFrame
 import com.screentranslator.core.*
 import com.screentranslator.engine.*
+import com.screentranslator.gemini.*
+import com.screentranslator.data.SecretUnavailable
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-enum class SearchPage { SELECT, EDITOR, PREVIEW, CLOSED }
+enum class SearchPage { SELECT, EDITOR, PREVIEW, RESULT, CLOSED }
 data class SearchUi(
     val page: SearchPage = SearchPage.SELECT,
     val screenshot: Bitmap? = null,
@@ -18,6 +20,9 @@ data class SearchUi(
     val preview: Bitmap? = null,
     val text: String = "",
     val translation: String? = null,
+    val answer: GroundedAnswer? = null,
+    val imageQuery: String = "Что изображено? Найди подтверждающую информацию и укажи неопределённость.",
+    val searchQuery: String = "",
     val message: String = "Проведите пальцем по нужной области",
     val busy: Boolean = false
 )
@@ -32,12 +37,13 @@ object SearchSessions {
 class ScreenSearchSession(
     val id: Long, frame: CapturedFrame, parent: CoroutineScope,
     private val coordinator: SessionCoordinator,
-    private val ocr: OcrEngine, private val translator: TranslationEngine,
-    private val pair: LanguagePair, private val cache: TranslationCache,
+    private val ocr: OcrEngine, private val translator: TranslationPipeline,
+    private val geminiSearch: GeminiSearchEngine?,
     private val files: SearchFiles,
     private val onAttached: () -> Unit,
     private val onClose: () -> Unit
 ) {
+    val mode get() = translator.mode
     private val scope = CoroutineScope(parent.coroutineContext + SupervisorJob(parent.coroutineContext[Job]))
     private val mutable = MutableStateFlow(SearchUi(screenshot = frame.bitmap))
     val ui = mutable.asStateFlow()
@@ -52,12 +58,13 @@ class ScreenSearchSession(
             message = if (valid) "Перемещайте рамку или тяните за края" else "Область слишком мала. Увеличьте рамку.")
     }
     fun edit(text: String) { if (!disposed) mutable.value = mutable.value.copy(text = text) }
+    fun editImageQuery(text: String) { if (!disposed) mutable.value = mutable.value.copy(imageQuery = text) }
     fun message(message: String) { if (!disposed) mutable.value = mutable.value.copy(message = message) }
     fun dismissTranslation() { mutable.value = mutable.value.copy(translation = null) }
     fun backToSelection() {
         if (!available()) { dispose(); return }
         task?.cancel(); coordinator.searchAction(Phase.SELECTING)
-        mutable.value = mutable.value.copy(page = SearchPage.SELECT, preview = null, text = "", busy = false, translation = null, message = "Выберите действие для выделенной области")
+        mutable.value = mutable.value.copy(page = SearchPage.SELECT, preview = null, text = "", busy = false, translation = null, answer = null, message = "Выберите действие для выделенной области")
     }
     private fun selectedInput(): Pair<Bitmap, PixelCrop>? {
         val state = mutable.value
@@ -80,20 +87,19 @@ class ScreenSearchSession(
             try {
                 val selected = crop(input)
                 // ML Kit already preserves line order inside a paragraph; order paragraphs top-to-bottom, left-to-right.
-                val blocks = ocr.recognize(selected).sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
+                val imageTranslations = if (translator.needsImageOcr) {
+                    coordinator.message(token, "Считываю изображение через Gemini")
+                    translator.translateImage(selected)
+                } else null
+                val blocks = (imageTranslations?.map { it.original } ?: ocr.recognize(selected)).sortedWith(compareBy({ it.bounds.top }, { it.bounds.left }))
                 ensureActive()
                 if (!coordinator.accepts(token)) return@launch
                 if (translate) {
                     if (blocks.isEmpty()) { fail(token, "Текст не найден. Попробуйте другую область."); return@launch }
                     if (!coordinator.advance(token, Phase.TRANSLATING)) return@launch
-                    mutable.value = mutable.value.copy(message = "Перевод…")
-                    val translated = withContext(Dispatchers.Default) {
-                        blocks.map { block ->
-                            ensureActive()
-                            val key = TranslationKey(block.text, pair)
-                            cache.get(key) ?: translator.translate(block.text).also { cache.put(key, it) }
-                        }.joinToString("\n\n")
-                    }
+                    val status = if (mode == AppMode.GEMINI) "Перевожу через Gemini" else "Перевожу текст"
+                    mutable.value = mutable.value.copy(message = status); coordinator.message(token, status)
+                    val translated = (imageTranslations ?: translator.translateBlocks(blocks)).joinToString("\n\n") { it.translation }
                     if (coordinator.advance(token, Phase.SELECTING)) mutable.value = mutable.value.copy(busy = false, translation = translated, message = "Перевод готов")
                 } else if (coordinator.advance(token, Phase.EDITING_QUERY)) {
                     mutable.value = mutable.value.copy(page = SearchPage.EDITOR, busy = false,
@@ -101,10 +107,10 @@ class ScreenSearchSession(
                         message = if (blocks.isEmpty()) "Текст не найден. Введите запрос вручную." else "Проверьте и при необходимости исправьте запрос")
                 }
             } catch (e: CancellationException) { throw e }
-            catch (_: Exception) {
+            catch (e: Exception) {
                 if (coordinator.accepts(token)) {
                     if (!translate) mutable.value = mutable.value.copy(page = SearchPage.EDITOR, text = "")
-                    fail(token, if (translate) "Не удалось перевести. Повторите попытку." else "Не удалось распознать текст. Введите запрос вручную или повторите выделение.")
+                    fail(token, safeError(e, if (translate) "Не удалось перевести. Повторите попытку." else "Не удалось распознать текст. Введите запрос вручную или повторите выделение."))
                 }
             }
         }
@@ -123,7 +129,7 @@ class ScreenSearchSession(
             try {
                 val image = crop(input)
                 if (coordinator.accepts(token)) mutable.value = mutable.value.copy(page = SearchPage.PREVIEW, preview = image, busy = false,
-                    message = "Будет передан только этот фрагмент. Выберите внешнее приложение для поиска.")
+                    message = if (mode == AppMode.GEMINI) "Введите запрос для Gemini или передайте фрагмент во внешнее приложение." else "Будет передан только этот фрагмент. Выберите внешнее приложение для поиска.")
             } catch (e: CancellationException) { throw e }
             catch (_: Exception) { fail(token, "Не удалось подготовить фрагмент. Повторите выделение.") }
         }
@@ -146,10 +152,31 @@ class ScreenSearchSession(
             catch (_: Exception) { fail(token, "Не удалось записать фрагмент. Проверьте свободное место и повторите попытку.") }
         }
     }
+    fun searchWithGemini(image: Boolean) {
+        if (!available() || mutable.value.busy || geminiSearch == null) return
+        val query = (if (image) mutable.value.imageQuery else mutable.value.text).trim()
+        if (query.isEmpty()) { message("Введите непустой запрос"); return }
+        val bitmap = if (image) mutable.value.preview ?: return else null
+        val token = coordinator.searchAction(Phase.SEARCHING)
+        task?.cancel()
+        mutable.value = mutable.value.copy(busy = true, message = "Ищу информацию", searchQuery = query)
+        task = scope.launch {
+            try {
+                val answer = geminiSearch.search(query, bitmap)
+                if (coordinator.advance(token, Phase.SEARCH_RESULT)) mutable.value = mutable.value.copy(page = SearchPage.RESULT, answer = answer, busy = false, message = "Готово")
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { fail(token, safeError(e, "Не удалось выполнить поиск. Повторите попытку.")) }
+        }
+    }
+    private fun safeError(error: Exception, fallback: String) = when (error) {
+        is GeminiException -> error.message!!
+        is SecretUnavailable -> "Не удалось расшифровать ключ. Сохраните его заново."
+        else -> fallback
+    }
     fun enteringExternal() { if (available()) coordinator.searchAction(Phase.EXTERNAL) }
     fun externalFailed(message: String) {
         if (!available()) { dispose(); return }
-        coordinator.searchAction(if (mutable.value.page == SearchPage.EDITOR) Phase.EDITING_QUERY else Phase.PREVIEWING_IMAGE)
+        coordinator.searchAction(when (mutable.value.page) { SearchPage.EDITOR -> Phase.EDITING_QUERY; SearchPage.RESULT -> Phase.SEARCH_RESULT; else -> Phase.PREVIEWING_IMAGE })
         message(message)
     }
     private fun fail(token: Long, message: String) {

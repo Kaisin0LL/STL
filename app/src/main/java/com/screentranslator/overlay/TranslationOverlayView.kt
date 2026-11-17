@@ -18,11 +18,12 @@ import kotlin.math.min
 /** Programmatic-only view. The controller owns its bitmap until this view is removed. */
 @android.annotation.SuppressLint("ViewConstructor")
 class TranslationOverlayView(context: Context, private val frame: CapturedFrame,
-    private val blocks: List<TranslatedBlock>, private val displayWidth: Int, private val displayHeight: Int,
+    private val blocks: List<TranslatedBlock>, private val blurred: Bitmap, private val footer: String, private val displayWidth: Int, private val displayHeight: Int,
     private val onBlock: (String) -> Unit) : View(context) {
     private val density = resources.displayMetrics.density
     private val background = Paint().apply { color = Color.rgb(19, 23, 30) }
     private val captionPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 12 * density }
+    private val shade = Paint().apply { color = 0x66000000 }
     private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val location = IntArray(2)
     private var layoutKey: List<Int>? = null
@@ -31,7 +32,6 @@ class TranslationOverlayView(context: Context, private val frame: CapturedFrame,
     private data class Label(val bounds: RectF, val padding: Float, val layout: StaticLayout, val overflow: RectF?)
     private var labels = emptyList<Label>()
     private var footerBounds = RectF()
-    private val footer = context.getString(R.string.google_attribution)
     init { contentDescription = "Переведённый снимок. Нажмите блок для полного текста, плавающую кнопку для закрытия."; isClickable = true }
     private fun prepareLayout() {
         val key = listOf(width, height, location[0], location[1])
@@ -69,7 +69,9 @@ class TranslationOverlayView(context: Context, private val frame: CapturedFrame,
         getLocationOnScreen(location); prepareLayout()
         canvas.drawColor(Color.BLACK)
         canvas.drawBitmap(frame.bitmap, null, bitmapBounds, bitmapPaint)
-        hitBoxes.forEach { canvas.drawRect(it.first, background) }
+        hitBoxes.forEach { (rect, _) ->
+            canvas.withClip(rect) { drawBitmap(blurred, null, bitmapBounds, bitmapPaint); drawRect(rect, shade) }
+        }
         // Do not grow labels into their neighbours. Every OCR block remains available by tapping.
         labels.forEach { label ->
             canvas.withClip(label.bounds) {

@@ -27,7 +27,10 @@ class OverlayController(private val context: Context, settings: Settings, privat
     private var result: View? = null
     private var detail: View? = null
     private var frame: CapturedFrame? = null
-    private fun translateLabel() = android.text.SpannableString("文\nGoogle").apply {
+    private var blurred: android.graphics.Bitmap? = null
+    private var attribution = "Powered by Google Translate"
+    private val provider = if (settings.mode == com.screentranslator.core.AppMode.GEMINI) "Gemini" else "Google"
+    private fun translateLabel() = android.text.SpannableString("文\n$provider").apply {
         setSpan(android.text.style.AbsoluteSizeSpan(10, true), 2, length, android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
     }
     private val button = TextView(context).apply {
@@ -35,7 +38,7 @@ class OverlayController(private val context: Context, settings: Settings, privat
         setTextColor(Color.rgb(168, 199, 250))
         background = GradientDrawable().apply { setColor(Color.rgb(28, 34, 45)); cornerRadius = 28 * dp; setStroke((2 * dp).toInt(), Color.rgb(168, 199, 250)) }
         elevation = 8 * dp
-        contentDescription = "Перевести экран с Google Translate"
+        contentDescription = "Перевести экран с $provider"
         setOnClickListener { onTap() }
         setOnLongClickListener { onSearch(); true }
     }
@@ -114,16 +117,16 @@ class OverlayController(private val context: Context, settings: Settings, privat
     }
     fun update(state: SessionState) {
         button.text = if (state.busy) "…" else if (state.phase == Phase.SHOWING) "×" else translateLabel()
-        button.contentDescription = if (state.busy) "Отменить перевод" else if (state.phase == Phase.SHOWING) "Скрыть перевод" else "Перевести экран с Google Translate. Удерживайте для поиска на экране"
+        button.contentDescription = if (state.busy) "Отменить обработку" else if (state.phase == Phase.SHOWING) "Скрыть перевод" else "Перевести экран с $provider. Удерживайте для поиска на экране"
     }
     fun hideForCapture() { hideResult(); button.visibility = View.INVISIBLE }
     fun hideButton() { button.visibility = View.INVISIBLE }
     fun showButton() { button.visibility = View.VISIBLE }
-    fun show(frame: CapturedFrame, blocks: List<TranslatedBlock>) {
+    fun show(frame: CapturedFrame, blocks: List<TranslatedBlock>, blurred: android.graphics.Bitmap, attribution: String) {
         hideResult()
-        this.frame = frame
+        this.frame = frame; this.blurred = blurred; this.attribution = attribution
         val bounds = displayBounds()
-        val view = TranslationOverlayView(context, frame, blocks, bounds.width(), bounds.height(), ::showFullText)
+        val view = TranslationOverlayView(context, frame, blocks, blurred, attribution, bounds.width(), bounds.height(), ::showFullText)
         result = view
         wm.addView(view, params(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT))
         raiseButton()
@@ -141,7 +144,7 @@ class OverlayController(private val context: Context, settings: Settings, privat
             setPadding((20 * dp).toInt() + b.left, b.top + (12 * dp).toInt(), (20 * dp).toInt(), display.bottom - b.bottom + (16 * dp).toInt())
         }
         layout.addView(Button(context).apply { this.text = "Назад к снимку"; setOnClickListener { remove(detail); detail = null } })
-        layout.addView(TextView(context).apply { setText(com.screentranslator.R.string.google_attribution); setTextColor(Color.LTGRAY); textSize = 12f })
+        layout.addView(TextView(context).apply { this.text = attribution; setTextColor(Color.LTGRAY); textSize = 12f })
         val scroll = ScrollView(context)
         scroll.addView(TextView(context).apply { this.text = text; textSize = 20f; setTextColor(Color.WHITE); setPadding(0, (20 * dp).toInt(), 0, (72 * dp).toInt()) })
         layout.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
@@ -152,6 +155,7 @@ class OverlayController(private val context: Context, settings: Settings, privat
         remove(detail); detail = null
         remove(result); result = null
         frame?.bitmap?.recycle(); frame = null
+        blurred?.recycle(); blurred = null
     }
     fun onConfigurationChanged() { hideResult(); position(); if (button.isAttachedToWindow) wm.updateViewLayout(button, buttonParams) }
     private fun remove(view: View?) {
